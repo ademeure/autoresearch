@@ -31,6 +31,48 @@ def _normalize_window_size(window_size):
     return left, right
 
 
+def _get_cuda_device_index(device=None):
+    get_device_index = getattr(torch.cuda, "_get_device_index", None)
+    if callable(get_device_index):
+        return get_device_index(device, optional=True)
+    if device is None:
+        return torch.cuda.current_device()
+    device_obj = torch.device(device)
+    if device_obj.type != "cuda":
+        raise ValueError(f"Expected a CUDA device, got {device_obj}")
+    return torch.cuda.current_device() if device_obj.index is None else device_obj.index
+
+
+def _patch_fa4_current_stream():
+    """Make torch.cuda.current_stream return a CUDA-handle-bearing stream when needed.
+
+    Under torch.compile on Torch 2.10, FA4 can observe a generic torch.Stream
+    without the legacy .cuda_stream attribute that flash_attn.cute expects.
+    When that happens, rebuild a CUDA stream wrapper from the raw handle.
+    """
+    original = torch.cuda.current_stream
+    if getattr(original, "_autoresearch_fa4_compat", False):
+        return False
+
+    raw_stream_getter = getattr(torch._C, "_cuda_getCurrentRawStream", None)
+    external_stream_cls = getattr(torch.cuda, "ExternalStream", None)
+    if raw_stream_getter is None or external_stream_cls is None:
+        return False
+
+    def current_stream(device=None):
+        stream = original(device)
+        if hasattr(stream, "cuda_stream"):
+            return stream
+        device_index = _get_cuda_device_index(device)
+        raw_handle = raw_stream_getter(device_index)
+        return external_stream_cls(raw_handle, device=device_index)
+
+    current_stream._autoresearch_fa4_compat = True
+    current_stream._autoresearch_fa4_original = original
+    torch.cuda.current_stream = current_stream
+    return True
+
+
 def _sdpa_attention(q, k, v, window_size):
     """SDPA attention with sliding-window support in (B, H, T, D) layout."""
     Tq = q.size(2)
@@ -100,6 +142,7 @@ def _load_flash_attention_4():
     if major < 9:
         return None
     try:
+        _patch_fa4_current_stream()
         from flash_attn.cute import flash_attn_func
         return _WrappedFlashAttention("fa4", flash_attn_func)
     except Exception:
@@ -124,6 +167,7 @@ _fa4 = _load_flash_attention_4()
 _fa3 = _load_flash_attention_3()
 HAS_FA4 = _fa4 is not None
 HAS_FA3 = _fa3 is not None
+FA4_STREAM_COMPAT_PATCHED = getattr(torch.cuda.current_stream, "_autoresearch_fa4_compat", False)
 
 
 def _resolve_flash_attention():
