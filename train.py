@@ -209,28 +209,32 @@ class GPT(nn.Module):
         self.attn_block_masks = None
 
     def build_attention_masks(self, device=None):
-        """Precompute per-layer sliding-window masks OUTSIDE any compiled region
-        so torch.compile / aten capture sees a SINGLE graph. Sliding-window
-        layers get a FlexAttention BlockMask (flex backend) or a dense bool mask
-        (SDPA fallback); full-causal layers get None (SDPA is_causal needs no
-        mask). Call once after .to(device)/init_weights and before capture or
-        torch.compile. Building masks lazily inside forward instead mutates a
-        module-global (_mask_cache) and calls create_block_mask under compile,
-        which graph-breaks the model into fragments. The mask_mod is batch- and
-        head-independent, so B=H=None broadcasts."""
+        """Precompute per-layer FlexAttention BlockMasks OUTSIDE any compiled
+        region so torch.compile / aten capture sees a SINGLE graph. Sliding-
+        window layers get a BlockMask; full-causal layers get None (SDPA
+        is_causal needs no mask). Call once after .to(device)/init_weights and
+        before capture/torch.compile. Building the mask lazily inside forward
+        instead mutates a module-global (_mask_cache) and calls create_block_mask
+        under compile, which graph-breaks the model into fragments. mask_mod is
+        batch/head-independent so B=H=None broadcasts.
+
+        FLEX-BACKEND ONLY: only create_block_mask induces the break. The SDPA
+        dense-mask path is pure traceable tensor ops (no break) and FA3 needs no
+        mask, so for those backends this is a no-op and attention() keeps its
+        existing, already-single-graph behavior."""
+        if _flex is None:
+            self.attn_block_masks = None
+            return self
         device = device if device is not None else self.cos.device
         T = self.config.sequence_len
         masks = []
         for w, _r in self.window_sizes:
             if w < 0 or w >= T:
                 masks.append(None)                         # full causal -> is_causal
-            elif _flex is not None:
+            else:
                 masks.append(create_block_mask(
                     lambda b, h, qi, ki, _w=w: (qi >= ki) & (qi - ki <= _w),
                     None, None, T, T, device=device))
-            else:                                          # SDPA dense fallback
-                ix = torch.arange(T, device=device)
-                masks.append((ix <= ix.unsqueeze(1)) & (ix.unsqueeze(1) - ix <= w))
         self.attn_block_masks = masks
         return self
 
