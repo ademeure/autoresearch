@@ -24,7 +24,6 @@ import torch.nn.functional as F
 _attn_backend = os.environ.get("ATTENTION", "").lower()
 _fa3 = None
 _flex = None
-_mask_cache = {}
 
 # 1) Flash Attention 3 — fastest, but Hopper (sm90) only
 if _attn_backend in ("", "fa3") and torch.cuda.get_device_capability()[0] == 9:
@@ -45,14 +44,13 @@ print(f"Attention backend: {_attn_backend}")
 def attention(q, k, v, window_size=(-1, -1), block_mask=None):
     """q,k,v are (B, T, H, D). Returns (B, T, H, D).
 
-    ``block_mask`` is the PRECOMPUTED sliding-window mask for this layer — a
-    FlexAttention BlockMask (flex backend) or a dense bool mask (SDPA fallback),
-    built ONCE outside the compiled region by ``GPT.build_attention_masks``.
-    Pass it in to keep the model a single graph: building the mask lazily here
-    mutates the module-global ``_mask_cache`` and calls ``create_block_mask``
-    inside ``torch.compile``, which graph-breaks the model into fragments. The
-    lazy path below is kept only as a fallback for callers that don't precompute
-    (e.g. eager use); the recipe always provides ``block_mask``.
+    ``block_mask`` is the PRECOMPUTED FlexAttention BlockMask for this layer's
+    sliding window, built ONCE in ``GPT.init_weights`` (the mask is a pure
+    function of seq_len + window) and threaded in. Passing it keeps the model a
+    SINGLE graph: ``create_block_mask`` is opaque to dynamo and graph-breaks the
+    model into fragments if called inside ``torch.compile``. The inline fallback
+    (``block_mask is None``) is only for eager use without ``init_weights``; it
+    rebuilds per call and graph-breaks under compile. No module-global cache.
     """
     # FA3 handles everything natively (no mask needed)
     if _fa3 is not None:
@@ -62,27 +60,21 @@ def attention(q, k, v, window_size=(-1, -1), block_mask=None):
     q, k, v = (t.transpose(1, 2) for t in (q, k, v))
     gqa = q.size(1) != k.size(1)
     w = window_size[0]
-    # full causal (no sliding window) — just use SDPA is_causal, it's fast everywhere
+    # full causal (no sliding window) — SDPA is_causal, fast everywhere, no mask
     if w < 0 or w >= T:
         return F.scaled_dot_product_attention(q, k, v, is_causal=True, enable_gqa=gqa).transpose(1, 2)
-    # sliding window — FlexAttention with block sparsity (fast), or SDPA with dense mask (slow)
+    # sliding window via FlexAttention block-sparsity (the precomputed BlockMask)
     if _flex is not None:
-        if block_mask is None:  # eager fallback (graph-breaks under compile)
-            key = (B, q.size(1), T, w, q.device)
-            if key not in _mask_cache:
-                _mask_cache[key] = create_block_mask(
-                    lambda b, h, qi, ki: (qi >= ki) & (qi - ki <= w),
-                    B, q.size(1), T, T, device=q.device)
-            block_mask = _mask_cache[key]
+        if block_mask is None:  # eager fallback only (graph-breaks under compile)
+            block_mask = create_block_mask(
+                lambda b, h, qi, ki: (qi >= ki) & (qi - ki <= w),
+                None, None, T, T, device=q.device)
         return _flex(q, k, v, block_mask=block_mask, enable_gqa=gqa).transpose(1, 2)
-    # SDPA fallback: dense T×T bool mask (O(T²) memory)
-    if block_mask is None:  # eager fallback (graph-breaks under compile)
-        key = (T, w, q.device)
-        if key not in _mask_cache:
-            ix = torch.arange(T, device=q.device)
-            _mask_cache[key] = (ix <= ix.unsqueeze(1)) & (ix.unsqueeze(1) - ix <= w)
-        block_mask = _mask_cache[key]
-    return F.scaled_dot_product_attention(q, k, v, attn_mask=block_mask, enable_gqa=gqa).transpose(1, 2)
+    # SDPA fallback: dense T×T bool mask — pure tensor ops, fully traceable (no
+    # graph break), so build it inline; the block-sparse precompute is flex-only.
+    ix = torch.arange(T, device=q.device)
+    mask = (ix <= ix.unsqueeze(1)) & (ix.unsqueeze(1) - ix <= w)
+    return F.scaled_dot_product_attention(q, k, v, attn_mask=mask, enable_gqa=gqa).transpose(1, 2)
 
 from prepare import MAX_SEQ_LEN, TIME_BUDGET, Tokenizer, make_dataloader, evaluate_bpb
 
@@ -208,36 +200,6 @@ class GPT(nn.Module):
         self.register_buffer("sin", sin, persistent=False)
         self.attn_block_masks = None
 
-    def build_attention_masks(self, device=None):
-        """Precompute per-layer FlexAttention BlockMasks OUTSIDE any compiled
-        region so torch.compile / aten capture sees a SINGLE graph. Sliding-
-        window layers get a BlockMask; full-causal layers get None (SDPA
-        is_causal needs no mask). Call once after .to(device)/init_weights and
-        before capture/torch.compile. Building the mask lazily inside forward
-        instead mutates a module-global (_mask_cache) and calls create_block_mask
-        under compile, which graph-breaks the model into fragments. mask_mod is
-        batch/head-independent so B=H=None broadcasts.
-
-        FLEX-BACKEND ONLY: only create_block_mask induces the break. The SDPA
-        dense-mask path is pure traceable tensor ops (no break) and FA3 needs no
-        mask, so for those backends this is a no-op and attention() keeps its
-        existing, already-single-graph behavior."""
-        if _flex is None:
-            self.attn_block_masks = None
-            return self
-        device = device if device is not None else self.cos.device
-        T = self.config.sequence_len
-        masks = []
-        for w, _r in self.window_sizes:
-            if w < 0 or w >= T:
-                masks.append(None)                         # full causal -> is_causal
-            else:
-                masks.append(create_block_mask(
-                    lambda b, h, qi, ki, _w=w: (qi >= ki) & (qi - ki <= _w),
-                    None, None, T, T, device=device))
-        self.attn_block_masks = masks
-        return self
-
     @torch.no_grad()
     def init_weights(self):
         # Embedding and unembedding
@@ -267,6 +229,23 @@ class GPT(nn.Module):
         head_dim = self.config.n_embd // self.config.n_head
         cos, sin = self._precompute_rotary_embeddings(self.rotary_seq_len, head_dim)
         self.cos, self.sin = cos, sin
+        # Precompute the per-layer FlexAttention sliding-window BlockMasks here,
+        # on the model's device, OUTSIDE any compiled region. The mask is a pure
+        # function of (seq_len, window), so it's a deterministic constant — and
+        # building it here (not lazily in forward) is exactly what keeps the
+        # flex backend a SINGLE graph: create_block_mask is opaque to dynamo and
+        # would graph-break the model if called under torch.compile. Flex-only;
+        # SDPA builds its dense mask inline (traceable) and FA3 needs none.
+        if _flex is not None:
+            T = self.config.sequence_len
+            self.attn_block_masks = [
+                None if (w < 0 or w >= T) else create_block_mask(
+                    lambda b, h, qi, ki, _w=w: (qi >= ki) & (qi - ki <= _w),
+                    None, None, T, T, device=cos.device)
+                for w, _r in self.window_sizes
+            ]
+        else:
+            self.attn_block_masks = None
         # Cast embeddings to bf16
         self.transformer.wte.to(dtype=torch.bfloat16)
         for ve in self.value_embeds.values():
@@ -362,11 +341,11 @@ class GPT(nn.Module):
         assert T <= self.cos.size(1)
         cos_sin = self.cos[:, :T], self.sin[:, :T]
 
-        # Precomputed per-layer sliding-window masks (built outside compile by
-        # build_attention_masks). None per layer = full-causal / not-yet-built;
-        # the attention() eager fallback covers the not-built case (with a
-        # graph break) so the model still runs if build_attention_masks wasn't
-        # called — but capture/compile callers must call it for a single graph.
+        # Per-layer flex sliding-window BlockMasks, precomputed in init_weights
+        # (outside compile). None per layer = full-causal or non-flex backend;
+        # attention()'s inline fallback covers a not-yet-built mask (with a graph
+        # break) so the model still runs before init_weights, but capture/compile
+        # always go through init_weights, so this is a single graph.
         block_masks = getattr(self, "attn_block_masks", None)
 
         x = self.transformer.wte(idx)
